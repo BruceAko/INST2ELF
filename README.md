@@ -20,7 +20,7 @@ pip3 install capstone
 
 ```command
 $python3 elfgen.py --help
-usage: elfgen.py [-h] [--output str] [--verbose] str [str ...]
+usage: elfgen.py [-h] [--output str] [--target {aarch64,x86_64}] [--verbose] str [str ...]
 
 positional arguments:
   str                   The filepaths of the bbt dump files
@@ -28,6 +28,8 @@ positional arguments:
 optional arguments:
   -h, --help            show this help message and exit
   --output str          Output path
+  --target {aarch64,x86_64}
+                        Output target architecture
   --verbose             Print more information of the tool
 ```
 
@@ -40,3 +42,9 @@ python3 elfgen.py raw_data/bbt_carts_20230629/bbt_dump_1 --output raw_data/bbt_c
 ```
 
 If successful, a binary file named raw_data/bbt_carts_20230629/bbt_elf_1.bin will be generated.
+
+For cross-ISA front-end analysis, the input trace can still be collected on AARCH64 while generating an x86_64 runnable binary:
+
+```shell
+python3 elfgen.py raw_data/bbt_dump_1 --output out/bbt_elf_1 --target x86_64
+```

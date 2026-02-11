@@ -1,5 +1,6 @@
 import argparse
 import logging
+import os
 import shutil
 import struct
 import subprocess
@@ -365,6 +366,196 @@ def one_target_optimizing(block: InstrBasicBlock, dreg_idx: int):
     block.real_mnemonic = "br"
     return True
 
+def build_jump_relationships(instr_stream: InstrStream, include_middle_jmps: bool):
+    # The jmp_block, which represents the main block that belong to the same addr with jmp instruction
+    # Fill the dst_addr_list and dst_idx_list of each jmp_block
+    pre_bidx = -1
+    for i, dst_bidx in enumerate(instr_stream.block_idx_stream):
+        if i > 0:
+            # dst_bidx will be appended to jmp_block instead of src_block
+            src_block = instr_stream.blocks_list[pre_bidx]
+            sup_block = src_block.super_block
+            jmp_block = instr_stream.blocks_list[sup_block.jmp_addr2idx[src_block.eaddr-4]]
+            if include_middle_jmps:
+                for jmp_addr in sup_block.jmp_addr2idx:
+                    if jmp_addr >= src_block.saddr and jmp_addr < src_block.eaddr - 4:
+                        # use -1 as the idx to represent jmp_addr + 4 since it may not be the start of a block
+                        instr_stream.blocks_list[sup_block.jmp_addr2idx[jmp_addr]].dst_idx_list.append(-1)
+                        instr_stream.blocks_list[sup_block.jmp_addr2idx[jmp_addr]].dst_addr_list.append(jmp_addr+4)
+            jmp_block.dst_idx_list.append(dst_bidx)
+            jmp_block.dst_addr_list.append(instr_stream.blocks_list[dst_bidx].saddr)
+        pre_bidx = dst_bidx
+
+def generate_stat_csv(instr_stream: InstrStream, csv_path: str, default_section_idx: int = 0):
+    for sb in instr_stream.sb_list:
+        sb.addr2info = {}
+
+    for bidx in instr_stream.block_idx_stream:
+        curr_block = instr_stream.blocks_list[bidx]
+        sup_block = curr_block.super_block
+        sec_idx = default_section_idx if curr_block.section is None else curr_block.section.index
+        addr = curr_block.saddr
+        while addr < curr_block.eaddr:
+            if addr not in sup_block.addr2info:
+                sup_block.addr2info[addr] = {
+                    'access_cnt': 1,
+                    'block_idx': [curr_block.index,],
+                    'super_block_idx': sup_block.index,
+                    'section_idx': sec_idx,
+                }
+                if curr_block.jmp_instr:
+                    sup_block.addr2info[addr]['jmp_mnemonic'] = [curr_block.jmp_instr.mnemonic,]
+                else:
+                    sup_block.addr2info[addr]['jmp_mnemonic'] = ["nop",]
+            else:
+                sup_block.addr2info[addr]['access_cnt'] += 1
+                if curr_block.index not in sup_block.addr2info[addr]['block_idx']:
+                    sup_block.addr2info[addr]['block_idx'].append(curr_block.index)
+                    if curr_block.jmp_instr:
+                        sup_block.addr2info[addr]['jmp_mnemonic'].append(curr_block.jmp_instr.mnemonic)
+            addr += 4
+
+    with open(csv_path, 'w') as stat_fw:
+        stat_fw.write("addr, access_cnt, block_idx, super_block_idx, section_idx, jmp_mnemonic\n")
+        # addr, count, block_idx, super_block_idx, section_idx, jmp_instr
+        for sb in instr_stream.sb_list:
+            addr = sb.saddr
+            while addr < sb.eaddr:
+                info = sb.addr2info.get(addr)
+                if info is None:
+                    info = {
+                        'access_cnt': 0,
+                        'block_idx': [],
+                        'super_block_idx': sb.index,
+                        'section_idx': default_section_idx,
+                        'jmp_mnemonic': ["nop",],
+                    }
+                stat_texts = []
+                stat_texts.append(hex(addr))
+                stat_texts.append(str(info['access_cnt']))
+                stat_texts.append('/'.join([str(bi) for bi in info['block_idx']]))
+                stat_texts.append(str(info['super_block_idx']))
+                stat_texts.append(str(info['section_idx']))
+                stat_texts.append('/'.join([str(bi) for bi in info['jmp_mnemonic']]))
+                stat_fw.write(', '.join(stat_texts)+'\n')
+                addr += 4
+
+def generate_x86_64_asm(instr_stream: InstrStream, asm_path: str, lds_path: str,
+                        exit_block_idx: int, entry_block_idx: int):
+    def emit_nops(fw, nop_num: int):
+        if nop_num <= 0:
+            return
+        fw.write("\t.rept\t"+str(nop_num)+"\n")
+        fw.write("\tnop\n")
+        fw.write("\t.endr\n")
+
+    def resolve_dst_label(dst_idx: int, dst_addr: int, addr2idx: dict):
+        if dst_idx != -1:
+            return "LBB"+str(dst_idx)
+        if dst_addr in addr2idx:
+            return "LBB"+str(addr2idx[dst_addr])
+        logging.warning("Unknown destination address %s in x86_64 backend, fallback to exit", hex(dst_addr))
+        return "LBB_EXIT"
+
+    addr2idx = {}
+    for block in instr_stream.blocks_list:
+        if block.saddr not in addr2idx:
+            addr2idx[block.saddr] = block.index
+
+    asm_basename = asm_path.split('/')[-1]
+    if asm_basename.endswith(".S"):
+        asm_basename = asm_basename[:-2]
+
+    table_entries = {}
+    for block in instr_stream.blocks_list:
+        if block.index == exit_block_idx:
+            continue
+        sup_block = block.super_block
+        rep_idx = sup_block.jmp_addr2idx[block.eaddr - 4]
+        if rep_idx != block.index:
+            continue
+        if len(block.dst_idx_list) == 0:
+            continue
+        table_entries[block.index] = []
+        for i, dst_idx in enumerate(block.dst_idx_list):
+            table_entries[block.index].append(resolve_dst_label(dst_idx, block.dst_addr_list[i], addr2idx))
+        table_entries[block.index].append("LBB_EXIT")
+
+    with open(asm_path, 'w') as asm_fw:
+        asm_fw.write("""
+\t.intel_syntax noprefix
+\t.file   "{0:s}.S"
+\t.text
+\t.globl main
+\t.type   main, @function
+main:
+\tpush rbp
+\tmov rbp, rsp
+\tcall pr_cntvct
+\tjmp LBB{1:d}
+
+LBB_EXIT:
+\tcall pr_cntvct
+\tmov eax, 1
+\tpop rbp
+\tret
+
+""".format(asm_basename, entry_block_idx))
+        for block in instr_stream.blocks_list:
+            sup_block = block.super_block
+            rep_idx = sup_block.jmp_addr2idx[block.eaddr - 4]
+            nop_num = max(0, block.total_length // 4 - 1)
+            asm_fw.write("LBB"+str(block.index)+":\n")
+            emit_nops(asm_fw, nop_num)
+            if block.index == exit_block_idx:
+                asm_fw.write("\tjmp LBB_EXIT\n\n")
+                continue
+            if rep_idx != block.index:
+                asm_fw.write("\tjmp LBB"+str(rep_idx)+"\n\n")
+                continue
+            if block.index in table_entries:
+                asm_fw.write("\tmov rax, QWORD PTR [rip + jmp_ptr_"+str(block.index)+"]\n")
+                asm_fw.write("\tmov rcx, QWORD PTR [rax]\n")
+                asm_fw.write("\tadd rax, 8\n")
+                asm_fw.write("\tmov QWORD PTR [rip + jmp_ptr_"+str(block.index)+"], rax\n")
+                asm_fw.write("\tjmp rcx\n\n")
+            else:
+                asm_fw.write("\tjmp LBB_EXIT\n\n")
+
+        asm_fw.write("\t.section .rodata\n")
+        asm_fw.write("\t.align 8\n")
+        for bidx in table_entries:
+            asm_fw.write("jmp_table_"+str(bidx)+":\n")
+            for label in table_entries[bidx]:
+                asm_fw.write("\t.quad "+label+"\n")
+
+        asm_fw.write("\n\t.data\n")
+        asm_fw.write("\t.align 8\n")
+        for bidx in table_entries:
+            asm_fw.write("jmp_ptr_"+str(bidx)+":\n")
+            asm_fw.write("\t.quad jmp_table_"+str(bidx)+"\n")
+        asm_fw.write("\n\t.section .note.GNU-stack,\"\",@progbits\n")
+
+    with open(lds_path, 'w') as lds_fw:
+        lds_fw.write("/* x86_64 backend does not use custom linker script. */\n")
+
+def generate_x86_64_helper(helper_path: str):
+    with open(helper_path, 'w') as helper_fw:
+        helper_fw.write("""
+#include <stdio.h>
+#include <stdint.h>
+
+void pr_cntvct(void)
+{
+\tunsigned int lo;
+\tunsigned int hi;
+\tunsigned long long ts;
+\tasm volatile("rdtsc" : "=a" (lo), "=d" (hi));
+\tts = ((unsigned long long)hi << 32) | lo;
+\tprintf("%llu\\n", ts);
+}
+""")
+
 class RecordParser:
     def __init__(self, filenames: list):
         self.filenames = filenames
@@ -409,6 +600,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(formatter_class=argparse.MetavarTypeHelpFormatter)
     parser.add_argument('filepaths', help="The filepaths of the bbt dump files", nargs='+', type=str)
     parser.add_argument('--output', help="Output path", type=str)
+    parser.add_argument('--target', choices=["aarch64", "x86_64"], default="aarch64",
+                        help="Output target architecture")
     parser.add_argument('--verbose', action="store_true", help="Print more information of the tool")
     args = parser.parse_args()
 
@@ -491,26 +684,50 @@ if __name__ == "__main__":
     min_addr = min_addr - EXIT_TPL_TEXT_LEN
 
     logging.info("+ Building jump relationships between blocks")
-    # The jmp_block, which represents the main block that belong to the same addr with jmp instruction
-    # Fill the dst_addr_list and dst_idx_list of each jmp_block
-    pre_bidx = -1
-    for i, dst_bidx in enumerate(instr_stream.block_idx_stream):
-        if i > 0:
-            # dst_bidx will be appended to jmp_block instead of src_block
-            src_block = instr_stream.blocks_list[pre_bidx]
-            sup_block = src_block.super_block
-            jmp_block = instr_stream.blocks_list[sup_block.jmp_addr2idx[src_block.eaddr-4]]
-            dst_block = instr_stream.blocks_list[dst_bidx]
-            dst_sup_block = dst_block.super_block
-            dst_jmp_block = instr_stream.blocks_list[dst_sup_block.jmp_addr2idx[dst_block.eaddr-4]]
-            for jmp_addr in sup_block.jmp_addr2idx:
-                if jmp_addr >= src_block.saddr and jmp_addr < src_block.eaddr - 4:
-                    # use -1 as the idx to represent jmp_addr + 4 since it may not be the start of a block
-                    instr_stream.blocks_list[sup_block.jmp_addr2idx[jmp_addr]].dst_idx_list.append(-1)
-                    instr_stream.blocks_list[sup_block.jmp_addr2idx[jmp_addr]].dst_addr_list.append(jmp_addr+4)
-            jmp_block.dst_idx_list.append(dst_bidx)
-            jmp_block.dst_addr_list.append(instr_stream.blocks_list[dst_bidx].saddr)
-        pre_bidx = dst_bidx
+    build_jump_relationships(instr_stream, include_middle_jmps=(args.target == "aarch64"))
+
+    if args.target == "x86_64":
+        # x86_64 backend replays branch targets at basic-block granularity.
+        logging.info("+ Generating x86_64 stat info CSV")
+        generate_stat_csv(instr_stream, bbt_output_path+"_stat.csv")
+
+        logging.info("+ Generating x86_64 ASM")
+        generate_x86_64_asm(instr_stream, bbt_output_path+".S", bbt_output_path+".lds",
+                            EXIT_TPL_TEXT_IDX, instr_stream.block_idx_stream[0])
+
+        logging.info("+ Generating x86_64 helper C file")
+        generate_x86_64_helper(bbt_output_path+"_helper.c")
+
+        logging.info("+ Generating elf binary file")
+        ret = subprocess.call(["gcc", "-c", bbt_output_path+".S", "-o", bbt_output_path+".o"], shell=False)
+        if ret != 0:
+            logging.warning("Failed to generate "+bbt_output_path+".o")
+            exit(1)
+        else:
+            logging.info("Succeed to generate "+bbt_output_path+".o")
+
+        ret = subprocess.call(["gcc", "-c", bbt_output_path+"_helper.c", "-o", bbt_output_path+"_helper.o"], shell=False)
+        if ret != 0:
+            logging.warning("Failed to generate "+bbt_output_path+"_helper.o")
+            exit(1)
+        else:
+            logging.info("Succeed to generate "+bbt_output_path+"_helper.o")
+
+        ret = subprocess.call(["gcc", "-no-pie", bbt_output_path+".o", bbt_output_path+"_helper.o",
+                               "-o", bbt_output_path+".bin"], shell=False)
+        if ret != 0:
+            logging.warning("Failed to generate "+bbt_output_path+".bin")
+            exit(1)
+        else:
+            logging.info("Succeed to generate "+bbt_output_path+".bin")
+
+        ret = subprocess.call([os.path.abspath(bbt_output_path+".bin")], shell=False)
+        if ret != 1:
+            logging.warning("Failed to execute "+bbt_output_path+".bin")
+            exit(1)
+        else:
+            logging.info("Succeed to execute "+bbt_output_path+".bin")
+        exit(0)
 
     logging.info("+ Generating Sections")
     # Init SectionStream and fill section_stream_list
@@ -821,6 +1038,7 @@ main:
         # Just put all data_asm to the end
         for reg in instr_stream.data_asm:
             asm_fw.writelines(instr_stream.data_asm[reg])
+        asm_fw.write("\t.section .note.GNU-stack,\"\",@progbits\n")
 
         lds_fw.write("}\n")
 
@@ -859,7 +1077,7 @@ void pr_cntvct(void)
     else:
         logging.info("Succeed to generate "+bbt_output_path+".bin")
 
-    ret = subprocess.call([bbt_output_path+".bin"], shell=False)
+    ret = subprocess.call([os.path.abspath(bbt_output_path+".bin")], shell=False)
     if ret != 1:
         logging.warning("Failed to execute "+bbt_output_path+".bin")
         exit(1)
