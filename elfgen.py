@@ -408,10 +408,6 @@ if __name__ == "__main__":
     # Parse script args
     parser = argparse.ArgumentParser(formatter_class=argparse.MetavarTypeHelpFormatter)
     parser.add_argument('filepaths', help="The filepaths of the bbt dump files", nargs='+', type=str)
-    parser.add_argument('--hotranges', help="The virtual memory ranges with hot attribute (Hexadecimal format needed)", \
-                        nargs='*', type=lambda x: int(x, 16))
-    parser.add_argument('--coldranges', help="The virtual memory ranges with cold attribute (Hexadecimal format needed)", \
-                        nargs='*', type=lambda x: int(x, 16))
     parser.add_argument('--output', help="Output path", type=str)
     parser.add_argument('--verbose', action="store_true", help="Print more information of the tool")
     args = parser.parse_args()
@@ -423,23 +419,6 @@ if __name__ == "__main__":
         logging.basicConfig(format='%(levelname)7s: %(message)s', level=logging.INFO)
     md = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
     md.detail = False
-
-    hot_ranges = []
-    cold_ranges = []
-    if args.hotranges is not None:
-        for i in range(len(args.hotranges)//2):
-            saddr = args.hotranges[i*2]
-            eaddr = args.hotranges[i*2+1]
-            hot_ranges.append([saddr, eaddr])
-
-    if args.coldranges is not None:
-        for i in range(len(args.coldranges)//2):
-            saddr = args.coldranges[i*2]
-            eaddr = args.coldranges[i*2+1]
-            cold_ranges.append([saddr, eaddr])
-
-    logging.debug("Hot VM Ranges: "+str(hot_ranges))
-    logging.debug("Cold VM Ranges: "+str(cold_ranges))
 
     # Parsing record from bbt_dump_filepath
     bbt_dump_filepaths = args.filepaths
@@ -543,20 +522,6 @@ if __name__ == "__main__":
 
     for i in range(len(instr_stream.sb_range_list)):
         sb = instr_stream.sb_list[i]
-        for hr in hot_ranges:
-            if sb.saddr >= hr[0] and sb.saddr < hr[1]:
-                sb.section_limit = hr
-                sb.access_attr = "hot"
-                if sb.eaddr > hr[1]:
-                    logging.warning("[%x, %x) cross hot range [%x, %x)" % (sb.saddr, sb.eaddr, hr[0], hr[1]))
-                    sb.section_limit[1] = sb.eaddr
-        for cr in cold_ranges:
-            if sb.saddr >= cr[0] and sb.saddr < cr[1]:
-                sb.section_limit = cr
-                sb.access_attr = "cold"
-                if sb.eaddr > cr[1]:
-                    logging.warning("[%x, %x) cross cold range [%x, %x)" % (sb.saddr, sb.eaddr, cr[0], cr[1]))
-                    sb.section_limit[1] = sb.eaddr
         section_stream_list[-1].sb_range_list.append([sb.saddr, sb.eaddr])
         section_stream_list[-1].sb_list.append(sb)
         for b in sb.blocks:
@@ -564,10 +529,7 @@ if __name__ == "__main__":
         section_stream_list[-1].length += sb.length
         if i < len(instr_stream.sb_range_list) - 1:
             bs = instr_stream.sb_range_list[i][1]
-            if sb.section_limit != []:
-                be = min(instr_stream.sb_range_list[i+1][0], sb.section_limit[1])
-            else:
-                be = instr_stream.sb_range_list[i+1][0]
+            be = instr_stream.sb_range_list[i+1][0]
             section_stream_list[-1].blank_list.append((be-bs, (bs, be)))
             section_stream_list[-1].max_length = be - section_stream_list[-1].sb_range_list[0][0]
             if instr_stream.sb_range_list[i+1][0] >= section_start + instr_stream.section_sz:
@@ -578,10 +540,7 @@ if __name__ == "__main__":
         else:
             # For the last superblock, just extend a huge range (100M) for it to store its jmp snippets
             bs = instr_stream.sb_range_list[i][1]
-            if sb.section_limit != []:
-                be = min(instr_stream.sb_range_list[i][1]+100*1024*1024, sb.section_limit[1])
-            else:
-                be = instr_stream.sb_range_list[i][1] + 100*1024*1024
+            be = instr_stream.sb_range_list[i][1] + 100*1024*1024
             blank = (be-bs, (bs, be))
             section_stream_list[-1].blank_list.append(blank)
             section_stream_list[-1].max_length = be - section_stream_list[-1].sb_range_list[0][0]
@@ -766,7 +725,6 @@ if __name__ == "__main__":
             if addr not in sup_block.addr2info:
                 sup_block.addr2info[addr] = {
                     'access_cnt': 1,
-                    'access_attr': sup_block.access_attr,
                     'block_idx': [curr_block.index,],
                     'super_block_idx': sup_block.index,
                     'section_idx': curr_block.section.index,
@@ -783,15 +741,14 @@ if __name__ == "__main__":
                         sup_block.addr2info[addr]['jmp_mnemonic'].append(curr_block.jmp_instr.mnemonic)
             addr += 4
     with open(bbt_output_path+"_stat.csv", 'w') as stat_fw:
-        stat_fw.write("addr, access_cnt, access_attr, block_idx, super_block_idx, section_idx, jmp_mnemonic\n")
-        # addr, count, hot/cold/normal, block_idx, super_block_idx, section_idx, jmp_instr
+        stat_fw.write("addr, access_cnt, block_idx, super_block_idx, section_idx, jmp_mnemonic\n")
+        # addr, count, block_idx, super_block_idx, section_idx, jmp_instr
         for sb in instr_stream.sb_list:
             addr = sb.saddr
             while addr < sb.eaddr:
                 stat_texts = []
                 stat_texts.append(hex(addr))
                 stat_texts.append(str(sb.addr2info[addr]['access_cnt']))
-                stat_texts.append(sb.addr2info[addr]['access_attr'])
                 stat_texts.append('/'.join([str(bi) for bi in sb.addr2info[addr]['block_idx']]))
                 stat_texts.append(str(sb.addr2info[addr]['super_block_idx']))
                 stat_texts.append(str(sb.addr2info[addr]['section_idx']))
@@ -813,9 +770,6 @@ if __name__ == "__main__":
 main:
 .LFB0:
 	.cfi_startproc
-	adrp	x0, hotcold_setting
-	add	x0, x0, #:lo12:hotcold_setting
-	blr	x0
 	adrp	x0, pr_cntvct
 	add	x0, x0, #:lo12:pr_cntvct
 	blr	x0
@@ -870,23 +824,10 @@ main:
 
         lds_fw.write("}\n")
 
-    logging.info("+ Generating hotcold function")
-    with open(bbt_output_path+"_hc.c", 'w') as hc_fw:
-        hc_fw.write("""
-#include <sys/mman.h>
+    logging.info("+ Generating helper C file")
+    with open(bbt_output_path+"_helper.c", 'w') as helper_fw:
+        helper_fw.write("""
 #include <stdio.h>
-
-#ifndef MADV_PAGE_HOT
-#define MADV_PAGE_HOT		26
-#endif
-
-#ifndef MADV_PAGE_COLD
-#define MADV_PAGE_COLD		27
-#endif
-
-#ifndef MADV_PAGE_NORMAL
-#define MADV_PAGE_NORMAL	28
-#endif
 
 void pr_cntvct(void)
 {
@@ -894,31 +835,7 @@ void pr_cntvct(void)
 	asm volatile("mrs %0, cntvct_el0" : "=r" (ts));
 	printf("%llu\\n", ts);
 }
-
-void hotcold_setting(void)
-{
-	unsigned long length;
-	void *addr;
 """)
-        for hr in hot_ranges:
-            assert hr[0] % PAGE_SIZE == 0
-            assert hr[1] % PAGE_SIZE == 0
-            assert hr[1] > hr[0]
-            hc_fw.write("\taddr = (void *)"+hex(hr[0])+';\n')
-            hc_fw.write("\tlength = "+str(hr[1]-hr[0])+';\n')
-            hc_fw.write("\tif (madvise(addr, length, MADV_PAGE_HOT))\n")
-            hc_fw.write('\t\tperror("madvise");\n')
-
-        for cr in cold_ranges:
-            assert cr[0] % PAGE_SIZE == 0
-            assert cr[1] % PAGE_SIZE == 0
-            assert cr[1] > cr[0]
-            hc_fw.write("\taddr = (void *)"+hex(cr[0])+';\n')
-            hc_fw.write("\tlength = "+str(cr[1]-cr[0])+';\n')
-            hc_fw.write("\tif (madvise(addr, length, MADV_PAGE_COLD))\n")
-            hc_fw.write('\t\tperror("madvise");\n')
-
-        hc_fw.write('}\n')
     # Generate bin file
     logging.info("+ Generating elf binary file")
     ret = subprocess.call(["gcc", "-c", bbt_output_path+".S", "-o", bbt_output_path+".o"], shell=False)
@@ -928,14 +845,14 @@ void hotcold_setting(void)
     else:
         logging.info("Succeed to generate "+bbt_output_path+".o")
 
-    ret = subprocess.call(["gcc", "-c", bbt_output_path+"_hc.c", "-o", bbt_output_path+"_hc.o"], shell=False)
+    ret = subprocess.call(["gcc", "-c", bbt_output_path+"_helper.c", "-o", bbt_output_path+"_helper.o"], shell=False)
     if ret != 0:
-        logging.warning("Failed to generate "+bbt_output_path+"_hc.o")
+        logging.warning("Failed to generate "+bbt_output_path+"_helper.o")
         exit(1)
     else:
-        logging.info("Succeed to generate "+bbt_output_path+"_hc.o")
+        logging.info("Succeed to generate "+bbt_output_path+"_helper.o")
 
-    ret = subprocess.call(["gcc", bbt_output_path+".o", bbt_output_path+"_hc.o", "-T", bbt_output_path+".lds", "-o", bbt_output_path+".bin"], shell=False)
+    ret = subprocess.call(["gcc", bbt_output_path+".o", bbt_output_path+"_helper.o", "-T", bbt_output_path+".lds", "-o", bbt_output_path+".bin"], shell=False)
     if ret != 0:
         logging.warning("Failed to generate "+bbt_output_path+".bin")
         exit(1)

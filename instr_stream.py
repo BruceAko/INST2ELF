@@ -132,8 +132,6 @@ class InstrSuperBlock:
         self.text_addr2idx = {}
         self.key_addrs = []
         self.blocks = []
-        self.section_limit = []
-        self.access_attr = "normal"
         self.addr2info = {}
 
     def add_block(self, block: InstrBasicBlock):
