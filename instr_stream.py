@@ -1,9 +1,16 @@
 # Branch Instructions
 # https://developer.arm.com/documentation/ddi0602/2023-03/Base-Instructions
 # https://developer.arm.com/documentation/den0024/a/The-A64-instruction-set/Data-processing-instructions/Conditional-instructions
+COND_BRANCH_INSTRS = [
+    "b.eq", "b.ne",
+    "b.hs", "b.cs", "b.lo", "b.cc",
+    "b.mi", "b.pl", "b.vs", "b.vc",
+    "b.hi", "b.ls",
+    "b.ge", "b.lt", "b.gt", "b.le",
+]
+
 JMP_INSTRS = ["b", "bl", "br", "blr", "ret",
-              "cbz", "cbnz", "tbz", "tbnz",
-              "b.hs", "b.lo", "b.ls", "b.ne", "b.hi", "b.ge", "b.lt", "b.eq", "b.le", "b.gt"]
+              "cbz", "cbnz", "tbz", "tbnz"] + COND_BRANCH_INSTRS
 
 JMP_INSTR_LIMITS = {
     "b": 128 * 1024 * 1024,
@@ -22,6 +29,12 @@ JMP_INSTR_LIMITS = {
     "b.eq": 1 * 1024 * 1024,
     "b.le": 1 * 1024 * 1024,
     "b.gt": 1 * 1024 * 1024,
+    "b.cs": 1 * 1024 * 1024,
+    "b.cc": 1 * 1024 * 1024,
+    "b.mi": 1 * 1024 * 1024,
+    "b.pl": 1 * 1024 * 1024,
+    "b.vs": 1 * 1024 * 1024,
+    "b.vc": 1 * 1024 * 1024,
 }
 
 def is_branch_instr(mnenomic):
@@ -31,7 +44,7 @@ def is_branch_instr(mnenomic):
         return False
 
 def is_condition_branch(mnenomic):
-    if mnenomic in JMP_INSTRS[5:]:
+    if mnenomic in COND_BRANCH_INSTRS or mnenomic in ["cbz", "cbnz", "tbz", "tbnz"]:
         return True
     else:
         return False
@@ -77,7 +90,13 @@ COND_GENE_VALS = {
     "b.eq": [0x60000000, 0x80000000], # Z set
     "b.ne": [0x80000000, 0x60000000], # Z clear
     "b.hs": [0x30000000, 0xC0000000], # C set
+    "b.cs": [0x30000000, 0xC0000000], # C set
     "b.lo": [0xC0000000, 0x30000000], # C clear
+    "b.cc": [0xC0000000, 0x30000000], # C clear
+    "b.mi": [0x80000000, 0x60000000], # N set
+    "b.pl": [0x60000000, 0x80000000], # N clear
+    "b.vs": [0x10000000, 0xC0000000], # V set
+    "b.vc": [0xC0000000, 0x10000000], # V clear
     "b.hi": [0x20000000, 0x40000000], # C set and Z clear
     "b.ls": [0x40000000, 0x20000000], # C clear or Z set
     "b.lt": [0x10000000, 0xD0000000], # N and V differ, (Z clear)

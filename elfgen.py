@@ -177,7 +177,7 @@ def one_target_handling(block: InstrBasicBlock, jmp_instr: InstrEntry):
             block.real_mnemonic = "b"
             block.used_length = 4
     else:
-        logging.warning("Unsupported branch instruction: ", jmp_instr.mnemonic)
+        logging.warning("Unsupported branch instruction: %s", jmp_instr.mnemonic)
         exit()
 
 # Should only be used in two_target_handling and tidx should always be found
