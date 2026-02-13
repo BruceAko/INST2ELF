@@ -5,11 +5,65 @@ import struct
 import subprocess
 from capstone import *
 from capstone.arm64 import *
+import instr_stream as instr_stream_cfg
 from instr_stream import *
+
+TARGET_ARCH = "arm64"
+X86_SLOT_BYTES = 8
+
+# Keep elfgen.py imported constants synchronized with instr_stream module globals.
+def refresh_arch_globals():
+    global REGS, JMP_TPL_DATA, JMP_TPL_TEXT, JMP_TPL_TEXT_LEN
+    global EXIT_TPL_TEXT, EXIT_TPL_TEXT_LEN, JMP_INSTR_LIMITS
+    global DATA_WORD_DIRECTIVE
+
+    REGS = instr_stream_cfg.REGS
+    JMP_TPL_DATA = instr_stream_cfg.JMP_TPL_DATA
+    JMP_TPL_TEXT = instr_stream_cfg.JMP_TPL_TEXT
+    JMP_TPL_TEXT_LEN = instr_stream_cfg.JMP_TPL_TEXT_LEN
+    EXIT_TPL_TEXT = instr_stream_cfg.EXIT_TPL_TEXT
+    EXIT_TPL_TEXT_LEN = instr_stream_cfg.EXIT_TPL_TEXT_LEN
+    JMP_INSTR_LIMITS = instr_stream_cfg.JMP_INSTR_LIMITS
+    DATA_WORD_DIRECTIVE = instr_stream_cfg.DATA_WORD_DIRECTIVE
+
+
+def is_x86_target():
+    return TARGET_ARCH == "x86_64"
+
+
+def is_conditional_like_branch(mnemonic: str):
+    if mnemonic in ["cbz", "cbnz", "tbz", "tbnz"]:
+        return True
+    return "b." in mnemonic
+
+
+def x86_addr_label(addr: int):
+    return "LADDR_" + format(addr, "x")
+
+
+def x86_write_slot_instruction(asm_fw, instruction: str):
+    asm_fw.write("1:\n")
+    asm_fw.write(instruction)
+    asm_fw.write("\t.fill\t"+str(X86_SLOT_BYTES)+"-(.-1b), 1, 0x90\n")
+
+
+def x86_write_text_entries(asm_fw, text_entries: list):
+    for entry in text_entries:
+        stripped = entry.strip()
+        if stripped == "":
+            asm_fw.write(entry)
+            continue
+        if stripped.endswith(":") or stripped.startswith("."):
+            asm_fw.write(entry)
+            continue
+        x86_write_slot_instruction(asm_fw, entry)
 
 # multi_targets_handling does not use block's index and jmp_instr
 # just use br mnemonic
 def multi_targets_handling(block: InstrBasicBlock):
+    if is_x86_target():
+        return multi_targets_handling_x86(block)
+
     # Fill text asm (inline style)
     if block.length//4 >= 2:
         text = "\tldr\t<dreg>, [<sreg>], #8\n"
@@ -32,7 +86,93 @@ def multi_targets_handling(block: InstrBasicBlock):
         block.sregs.append(REGS[1])
         block.used_length = 4
 
+
+def multi_targets_handling_x86(block: InstrBasicBlock):
+    # Inline style: consume one pointer from jump table and branch indirectly.
+    if block.length//4 >= 2:
+        block.text_asm.append("\tlea\t"+REGS[1]+", ["+REGS[1]+"+8]\n")
+        block.text_asm.append("\tjmp\tqword ptr ["+REGS[1]+"-8]\n")
+        block.real_mnemonic = "br"
+        block.dregs.append(REGS[0])
+        block.dblks.append(block)
+        block.sregs.append(REGS[1])
+        block.used_length = 8
+    else:
+        # Snippet style for tiny blocks.
+        for entry in JMP_TPL_TEXT:
+            block.jmp_asm.append(entry.replace('$', str(block.index)).replace('<sreg>', REGS[1]))
+        block.text_asm.append("\tjmp\tjmp_snippet"+str(block.index)+'\n')
+        block.real_mnemonic = "br"
+        block.dregs.append(REGS[0])
+        block.dblks.append(block)
+        block.sregs.append(REGS[1])
+        block.used_length = 4
+
+
+def one_target_handling_x86(block: InstrBasicBlock, jmp_instr: InstrEntry):
+    mnemonic = jmp_instr.mnemonic
+    dst_addr = block.dst_addr_list[0]
+    dst_idx = block.dst_idx_list[0]
+
+    if mnemonic in ["b", "bl", "br", "blr", "ret"]:
+        if dst_addr == block.eaddr:
+            block.used_length = 0
+            block.real_mnemonic = "nop"
+        elif dst_idx >= 0:
+            block.text_asm.append("\tjmp\tLBB"+str(dst_idx)+'\n')
+            block.real_mnemonic = "b"
+            block.used_length = 4
+        else:
+            multi_targets_handling_x86(block)
+    elif is_conditional_like_branch(mnemonic):
+        if dst_addr == block.eaddr:
+            block.used_length = 0
+            block.real_mnemonic = "nop"
+        elif dst_idx >= 0 and block.length//4 >= 3:
+            # Use a deterministic boolean and keep a conditional branch shape.
+            block.text_asm.append("\tmov\t"+REGS[0]+", 1\n")
+            block.text_asm.append("\ttest\t"+REGS[0]+", "+REGS[0]+"\n")
+            block.text_asm.append("\tjne\tLBB"+str(dst_idx)+'\n')
+            block.real_mnemonic = mnemonic
+            block.used_length = 3 * 4
+        elif dst_idx >= 0:
+            block.text_asm.append("\tjmp\tLBB"+str(dst_idx)+'\n')
+            block.real_mnemonic = "b"
+            block.used_length = 4
+        else:
+            multi_targets_handling_x86(block)
+    else:
+        logging.warning("Unsupported branch instruction: %s", jmp_instr.mnemonic)
+        exit()
+
+
+def two_targets_handling_x86(block: InstrBasicBlock, jmp_instr: InstrEntry):
+    mnemonic = jmp_instr.mnemonic
+    if mnemonic in ["b", "bl", "br", "blr", "ret"]:
+        logging.warning("Direct/Indirect branch at "+hex(block.eaddr-4)+" has two targets on x86 path, fallback to br")
+        multi_targets_handling_x86(block)
+        return
+
+    if block.eaddr in block.dst_addr_list and block.length//4 >= 3:
+        tidx = find_target_branch_idx(block)
+        if tidx >= 0:
+            # Non-zero means branch-taken, zero means fall-through.
+            block.text_asm.append("\tcmp\tqword ptr ["+REGS[1]+"], 0\n")
+            block.text_asm.append("\tlea\t"+REGS[1]+", ["+REGS[1]+"+8]\n")
+            block.text_asm.append("\tjne\tLBB"+str(tidx)+'\n')
+            block.real_mnemonic = mnemonic
+            block.dregs.append(REGS[0])
+            block.dblks.append(block)
+            block.sregs.append(REGS[1])
+            block.used_length = 3 * 4
+            return
+    multi_targets_handling_x86(block)
+
+
 def one_target_handling(block: InstrBasicBlock, jmp_instr: InstrEntry):
+    if is_x86_target():
+        return one_target_handling_x86(block, jmp_instr)
+
     # Handle jmp instructions that will only jmp to the next addr
     mnemonic = jmp_instr.mnemonic
     if mnemonic in ["b", "bl"]:
@@ -189,6 +329,9 @@ def find_target_branch_idx(block: InstrBasicBlock):
             return block.dst_idx_list[i]
 
 def two_targets_handling(block: InstrBasicBlock, jmp_instr: InstrEntry):
+    if is_x86_target():
+        return two_targets_handling_x86(block, jmp_instr)
+
     mnemonic = jmp_instr.mnemonic
     if mnemonic in ["b", "bl", "br", "blr", "ret"]:
         # Just use `br`
@@ -260,47 +403,59 @@ def two_targets_handling(block: InstrBasicBlock, jmp_instr: InstrEntry):
         logging.warning("UNKNOWN JMP INST")
 
 def jmp_table_add_dst(block: InstrBasicBlock, daddr: int, reg: str):
+    if is_x86_target():
+        instr_stream.data_asm[reg].append("\t# "+str(block.index)+'\n')
+        if block.real_mnemonic == "br":
+            if daddr == 0:
+                instr_stream.data_asm[reg].append("\t"+DATA_WORD_DIRECTIVE+"\t0\n")
+            else:
+                instr_stream.data_asm[reg].append("\t"+DATA_WORD_DIRECTIVE+"\t"+x86_addr_label(daddr)+'\n')
+        elif is_conditional_like_branch(block.real_mnemonic):
+            value = 0 if daddr == block.eaddr else 1
+            instr_stream.data_asm[reg].append("\t"+DATA_WORD_DIRECTIVE+"\t"+str(value)+'\n')
+        return
+
     if "b." in block.real_mnemonic:
         if daddr == block.eaddr:
             instr_stream.data_asm[reg].append("\t// "+str(block.index)+'\n')
-            instr_stream.data_asm[reg].append("\t.xword\t"+hex(COND_GENE_VALS[block.real_mnemonic][1])+'\n')
+            instr_stream.data_asm[reg].append("\t"+DATA_WORD_DIRECTIVE+"\t"+hex(COND_GENE_VALS[block.real_mnemonic][1])+'\n')
         else:
             instr_stream.data_asm[reg].append("\t// "+str(block.index)+'\n')
-            instr_stream.data_asm[reg].append("\t.xword\t"+hex(COND_GENE_VALS[block.real_mnemonic][0])+'\n')
+            instr_stream.data_asm[reg].append("\t"+DATA_WORD_DIRECTIVE+"\t"+hex(COND_GENE_VALS[block.real_mnemonic][0])+'\n')
     elif block.real_mnemonic in ["cbz", "cbnz"]:
         if daddr == block.eaddr:
             if block.real_mnemonic == "cbz":
                 instr_stream.data_asm[reg].append("\t// "+str(block.index)+'\n')
-                instr_stream.data_asm[reg].append("\t.xword\t1\n")
+                instr_stream.data_asm[reg].append("\t"+DATA_WORD_DIRECTIVE+"\t1\n")
             else:
                 instr_stream.data_asm[reg].append("\t// "+str(block.index)+'\n')
-                instr_stream.data_asm[reg].append("\t.xword\t0\n")
+                instr_stream.data_asm[reg].append("\t"+DATA_WORD_DIRECTIVE+"\t0\n")
         else:
             if block.real_mnemonic == "cbz":
                 instr_stream.data_asm[reg].append("\t// "+str(block.index)+'\n')
-                instr_stream.data_asm[reg].append("\t.xword\t0\n")
+                instr_stream.data_asm[reg].append("\t"+DATA_WORD_DIRECTIVE+"\t0\n")
             else:
                 instr_stream.data_asm[reg].append("\t// "+str(block.index)+'\n')
-                instr_stream.data_asm[reg].append("\t.xword\t1\n")
+                instr_stream.data_asm[reg].append("\t"+DATA_WORD_DIRECTIVE+"\t1\n")
     elif block.real_mnemonic in ["tbz", "tbnz"]:
         bit_pos = int(block.jmp_instr.op_str.split(', ')[1].replace('#', ''), 16)
         if daddr == block.eaddr:
             if block.real_mnemonic == "tbz":
                 instr_stream.data_asm[reg].append("\t// "+str(block.index)+'\n')
-                instr_stream.data_asm[reg].append("\t.xword\t"+hex(1<<bit_pos)+"\n")
+                instr_stream.data_asm[reg].append("\t"+DATA_WORD_DIRECTIVE+"\t"+hex(1<<bit_pos)+"\n")
             else:
                 instr_stream.data_asm[reg].append("\t// "+str(block.index)+'\n')
-                instr_stream.data_asm[reg].append("\t.xword\t"+hex(0)+"\n")
+                instr_stream.data_asm[reg].append("\t"+DATA_WORD_DIRECTIVE+"\t"+hex(0)+"\n")
         else:
             if block.real_mnemonic == "tbz":
                 instr_stream.data_asm[reg].append("\t// "+str(block.index)+'\n')
-                instr_stream.data_asm[reg].append("\t.xword\t"+hex(0)+"\n")
+                instr_stream.data_asm[reg].append("\t"+DATA_WORD_DIRECTIVE+"\t"+hex(0)+"\n")
             else:
                 instr_stream.data_asm[reg].append("\t// "+str(block.index)+'\n')
-                instr_stream.data_asm[reg].append("\t.xword\t"+hex(1<<bit_pos)+"\n")
+                instr_stream.data_asm[reg].append("\t"+DATA_WORD_DIRECTIVE+"\t"+hex(1<<bit_pos)+"\n")
     elif block.real_mnemonic == "br":
         instr_stream.data_asm[reg].append("\t// "+str(block.index)+'\n')
-        instr_stream.data_asm[reg].append("\t.xword\t"+hex(daddr)+'\n')
+        instr_stream.data_asm[reg].append("\t"+DATA_WORD_DIRECTIVE+"\t"+hex(daddr)+'\n')
     # else:
     # logging.error("UNKNOWN MNEMONIC")
 
@@ -409,14 +564,20 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(formatter_class=argparse.MetavarTypeHelpFormatter)
     parser.add_argument('filepaths', help="The filepaths of the bbt dump files", nargs='+', type=str)
     parser.add_argument('--output', help="Output path", type=str)
+    parser.add_argument('--target-arch', help="Output binary arch", choices=instr_stream_cfg.SUPPORTED_OUTPUT_ARCHS, default="arm64")
     parser.add_argument('--verbose', action="store_true", help="Print more information of the tool")
     args = parser.parse_args()
 
     # Configuration
+    TARGET_ARCH = args.target_arch
+    instr_stream_cfg.set_output_arch(TARGET_ARCH)
+    refresh_arch_globals()
+
     if args.verbose:
         logging.basicConfig(format='%(levelname)7s: %(message)s', level=logging.DEBUG)
     else:
         logging.basicConfig(format='%(levelname)7s: %(message)s', level=logging.INFO)
+    logging.info("+ Output target arch: "+TARGET_ARCH)
     md = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
     md.detail = False
 
@@ -567,25 +728,26 @@ if __name__ == "__main__":
                 sb.text_addr2idx[b.eaddr-b.length] = b.index
 
     logging.info("+ Remove redundant jmp_snippet")
-    unhandled_blocks = []
-    for sb in instr_stream.sb_list:
-        for b in sb.blocks:
-            if sb.jmp_addr2idx[b.eaddr - 4] == b.index and b.jmp_asm != []:
-                assert b.length == 4
-                assert b.used_length == 4
-                unhandled_blocks.append(b)
-    unhandled_blocks.sort(key=lambda b: len(b.dst_addr_list), reverse=True)
+    if not is_x86_target():
+        unhandled_blocks = []
+        for sb in instr_stream.sb_list:
+            for b in sb.blocks:
+                if sb.jmp_addr2idx[b.eaddr - 4] == b.index and b.jmp_asm != []:
+                    assert b.length == 4
+                    assert b.used_length == 4
+                    unhandled_blocks.append(b)
+        unhandled_blocks.sort(key=lambda b: len(b.dst_addr_list), reverse=True)
 
-    reg_idx = 2
-    for b in unhandled_blocks:
-        if reg_idx+1 < len(REGS):
-            dst_addr_set = list(set(b.dst_addr_list))
-            if len(dst_addr_set) == 1:
-                # TODO
-                pass
-            else:
-                if multi_target_optimizing(b, reg_idx, reg_idx+1):
-                    reg_idx += 2
+        reg_idx = 2
+        for b in unhandled_blocks:
+            if reg_idx+1 < len(REGS):
+                dst_addr_set = list(set(b.dst_addr_list))
+                if len(dst_addr_set) == 1:
+                    # TODO
+                    pass
+                else:
+                    if multi_target_optimizing(b, reg_idx, reg_idx+1):
+                        reg_idx += 2
 
     logging.info("+ Filling Superblock's text_asm")
     overlapped_sb_num = 0
@@ -598,6 +760,8 @@ if __name__ == "__main__":
         asm_len = 0
         curr_addr = sb.saddr
         while curr_addr < sb.eaddr:
+            if is_x86_target():
+                sb.text_asm.append(x86_addr_label(curr_addr)+":\n")
             # Add label
             if curr_addr in sb.label_addr2idxs:
                 for idx in sb.label_addr2idxs[curr_addr]:
@@ -757,10 +921,42 @@ if __name__ == "__main__":
                 addr += 4
 
     logging.info("+ Generating ASM")
+    if is_x86_target():
+        with open(bbt_output_path+".S", 'w') as asm_fw:
+            asm_fw.write("""
+	.intel_syntax noprefix
+	.file   "{0:s}.S"
+	.text
+	.global main
+	.type   main, @function
+main:
+	call	pr_cntvct
+""".format(bbt_output_path.split()[-1]))
+            for reg in instr_stream.used_regs:
+                asm_fw.write("\tlea\t"+reg+", jmp_table_"+reg+"[rip]\n")
+            asm_fw.write("\tjmp\tLBB0\n\n")
+            for i, ss in enumerate(section_stream_list):
+                asm_fw.write("\t.section\t.Mtext_"+str(i)+", \"ax\"\n\n")
+                asm_fw.write("\t.align 16\n")
+                x86_write_text_entries(asm_fw, ss.text_asm)
+                asm_fw.write("\n")
+            asm_fw.write("""
+	.section .Mtext_post, "ax"
+Mtext_post:
+	call	pr_cntvct
+	mov	edi, 1
+	jmp	exit
 
-    shutil.copyfile("template.lds", bbt_output_path+".lds")
-    with open(bbt_output_path+".S", 'w') as asm_fw, open(bbt_output_path+".lds", 'a') as lds_fw:
-        asm_fw.write("""
+	.section .Mdata, "aw"
+	.align 8
+""")
+            for reg in instr_stream.data_asm:
+                asm_fw.writelines(instr_stream.data_asm[reg])
+            asm_fw.write("\t.section\t.note.GNU-stack,\"\",@progbits\n")
+    else:
+        shutil.copyfile("template.lds", bbt_output_path+".lds")
+        with open(bbt_output_path+".S", 'w') as asm_fw, open(bbt_output_path+".lds", 'a') as lds_fw:
+            asm_fw.write("""
 	.arch armv8-a
 	.file   "{0:s}.S"
 	.text
@@ -787,46 +983,62 @@ main:
 
 	.section .Mtext_pre, "ax"
 """.format(bbt_output_path.split()[-1]))
-        for reg in instr_stream.used_regs:
-            asm_fw.write("\tadrp\t"+reg+", jmp_table_"+reg+'\n')
-            asm_fw.write("\tadd\t"+reg+", "+reg+", #:lo12:jmp_table_"+reg+'\n')
-        asm_fw.write("""
+            for reg in instr_stream.used_regs:
+                asm_fw.write("\tadrp\t"+reg+", jmp_table_"+reg+'\n')
+                asm_fw.write("\tadd\t"+reg+", "+reg+", #:lo12:jmp_table_"+reg+'\n')
+            asm_fw.write("""
 	adrp	x0, LBB0
 	add	x0, x0, #:lo12:LBB0
 	br	x0
 """)
-        assert min_addr > 0xffff00000000
-        lds_fw.write("  . = 0xffff0000;\n")
-        lds_fw.write("  .Mtext_post : { *(.Mtext_post) }\n")
-        lds_fw.write("  . = 0xfffe10000000;\n")
-        lds_fw.write("  .Mdata : { *(.Mdata) }\n")
-        lds_fw.write("  . = 0xffff00000000;\n")
-        lds_fw.write("  .Mtext_pre : { *(.Mtext_pre) }\n")
-        for i, ss in enumerate(section_stream_list):
-            section_start = ss.sb_range_list[0][0]
-            paddings = []
-            if i == 0 or section_start // 16 * 16 >= section_stream_list[i-1].sb_range_list[0][0] + section_stream_list[i-1].length:
-                paddings = ["\tnop\n",] * ((section_start % 16)//4)
-                section_start = ss.sb_range_list[0][0] // 16 * 16
-            lds_fw.write("  . = "+hex(section_start)+";\n")
-            lds_fw.write("  .Mtext_"+str(i)+" : { *(.Mtext_"+str(i)+") }\n")
-            asm_fw.write("\t.section\t.Mtext_"+str(i)+", \"ax\"\n\n")
-            asm_fw.write("\t.align 2\n")
-            asm_fw.writelines(paddings)
-            asm_fw.writelines(ss.text_asm)
-            asm_fw.write("\n")
+            assert min_addr > 0xffff00000000
+            lds_fw.write("  . = 0xffff0000;\n")
+            lds_fw.write("  .Mtext_post : { *(.Mtext_post) }\n")
+            lds_fw.write("  . = 0xfffe10000000;\n")
+            lds_fw.write("  .Mdata : { *(.Mdata) }\n")
+            lds_fw.write("  . = 0xffff00000000;\n")
+            lds_fw.write("  .Mtext_pre : { *(.Mtext_pre) }\n")
+            for i, ss in enumerate(section_stream_list):
+                section_start = ss.sb_range_list[0][0]
+                paddings = []
+                if i == 0 or section_start // 16 * 16 >= section_stream_list[i-1].sb_range_list[0][0] + section_stream_list[i-1].length:
+                    paddings = ["\tnop\n",] * ((section_start % 16)//4)
+                    section_start = ss.sb_range_list[0][0] // 16 * 16
+                lds_fw.write("  . = "+hex(section_start)+";\n")
+                lds_fw.write("  .Mtext_"+str(i)+" : { *(.Mtext_"+str(i)+") }\n")
+                asm_fw.write("\t.section\t.Mtext_"+str(i)+", \"ax\"\n\n")
+                asm_fw.write("\t.align 2\n")
+                asm_fw.writelines(paddings)
+                asm_fw.writelines(ss.text_asm)
+                asm_fw.write("\n")
 
-        asm_fw.write("\t.section\t.Mdata, \"aw\"\n\n")
-        asm_fw.write("\t.align 3\n")
-        # Just put all data_asm to the end
-        for reg in instr_stream.data_asm:
-            asm_fw.writelines(instr_stream.data_asm[reg])
+            asm_fw.write("\t.section\t.Mdata, \"aw\"\n\n")
+            asm_fw.write("\t.align 3\n")
+            # Just put all data_asm to the end
+            for reg in instr_stream.data_asm:
+                asm_fw.writelines(instr_stream.data_asm[reg])
+            asm_fw.write("\t.section\t.note.GNU-stack,\"\",@progbits\n")
 
-        lds_fw.write("}\n")
+            lds_fw.write("}\n")
 
     logging.info("+ Generating helper C file")
     with open(bbt_output_path+"_helper.c", 'w') as helper_fw:
-        helper_fw.write("""
+        if is_x86_target():
+            helper_fw.write("""
+#include <stdint.h>
+#include <stdio.h>
+
+void pr_cntvct(void)
+{
+	unsigned int lo, hi;
+	unsigned long long ts;
+	asm volatile("rdtsc" : "=a" (lo), "=d" (hi));
+	ts = (((unsigned long long)hi) << 32) | lo;
+	printf("%llu\\n", ts);
+}
+""")
+        else:
+            helper_fw.write("""
 #include <stdio.h>
 
 void pr_cntvct(void)
@@ -852,7 +1064,10 @@ void pr_cntvct(void)
     else:
         logging.info("Succeed to generate "+bbt_output_path+"_helper.o")
 
-    ret = subprocess.call(["gcc", bbt_output_path+".o", bbt_output_path+"_helper.o", "-T", bbt_output_path+".lds", "-o", bbt_output_path+".bin"], shell=False)
+    if is_x86_target():
+        ret = subprocess.call(["gcc", bbt_output_path+".o", bbt_output_path+"_helper.o", "-o", bbt_output_path+".bin"], shell=False)
+    else:
+        ret = subprocess.call(["gcc", bbt_output_path+".o", bbt_output_path+"_helper.o", "-T", bbt_output_path+".lds", "-o", bbt_output_path+".bin"], shell=False)
     if ret != 0:
         logging.warning("Failed to generate "+bbt_output_path+".bin")
         exit(1)

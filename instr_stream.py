@@ -1,3 +1,5 @@
+"""Instruction stream data structures and architecture-aware asm templates."""
+
 # Branch Instructions
 # https://developer.arm.com/documentation/ddi0602/2023-03/Base-Instructions
 # https://developer.arm.com/documentation/den0024/a/The-A64-instruction-set/Data-processing-instructions/Conditional-instructions
@@ -12,7 +14,7 @@ COND_BRANCH_INSTRS = [
 JMP_INSTRS = ["b", "bl", "br", "blr", "ret",
               "cbz", "cbnz", "tbz", "tbnz"] + COND_BRANCH_INSTRS
 
-JMP_INSTR_LIMITS = {
+ARM_JMP_INSTR_LIMITS = {
     "b": 128 * 1024 * 1024,
     "bl": 128 * 1024 * 1024,
     "cbz": 1 * 1024 * 1024,
@@ -37,6 +39,10 @@ JMP_INSTR_LIMITS = {
     "b.vc": 1 * 1024 * 1024,
 }
 
+X86_JMP_INSTR_LIMITS = {
+    mnemonic: 1 << 60 for mnemonic in ARM_JMP_INSTR_LIMITS
+}
+
 def is_branch_instr(mnenomic):
     if mnenomic in JMP_INSTRS:
         return True
@@ -51,11 +57,16 @@ def is_condition_branch(mnenomic):
 
 PAGE_SIZE = 4 * 1024
 
-REGS = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9",
-        "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x18", "x19",
-        "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28"]
+SUPPORTED_OUTPUT_ARCHS = ("arm64", "x86_64")
 
-JMP_TPL_DATA = [
+ARM_REGS = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9",
+            "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x18", "x19",
+            "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28"]
+
+X86_REGS = ["rax", "rbx", "r12", "r13", "r14", "r15", "r10", "r11", "r9",
+            "r8", "rcx", "rdx", "rsi", "rdi"]
+
+ARM_JMP_TPL_DATA = [
     "\t.globl\tjmp_table$\n",
     "\t.type\tjmp_table$, %object\n",
     "\t.align 3\n",
@@ -63,7 +74,15 @@ JMP_TPL_DATA = [
     # JMP TARGET LIST
 ]
 
-JMP_TPL_TEXT = [
+X86_JMP_TPL_DATA = [
+    "\t.globl\tjmp_table$\n",
+    "\t.type\tjmp_table$, @object\n",
+    "\t.align 8\n",
+    "jmp_table$:\n",
+    # JMP TARGET LIST
+]
+
+ARM_JMP_TPL_TEXT = [
     "\t.align\t2\n",
     "\t.globl\tjmp_snippet$\n",
     "\t.type\tjmp_snippet$, @function\n",
@@ -72,15 +91,69 @@ JMP_TPL_TEXT = [
     "\tbr\tx0\n",
 ]
 
-JMP_TPL_TEXT_LEN = 2 * 4
+X86_JMP_TPL_TEXT = [
+    "\t.globl\tjmp_snippet$\n",
+    "\t.type\tjmp_snippet$, @function\n",
+    "jmp_snippet$:\n",
+    "\tlea\t<sreg>, [<sreg>+8]\n",
+    "\tjmp\tqword ptr [<sreg>-8]\n",
+]
 
-EXIT_TPL_TEXT = [
+ARM_JMP_TPL_TEXT_LEN = 2 * 4
+X86_JMP_TPL_TEXT_LEN = 2 * 4
+
+ARM_EXIT_TPL_TEXT = [
     "\tmov\tx0, 0xffff\n",
     "\tlsl x0, x0, #16\n",
     "\tbr\tx0\n"
 ]
 
+X86_EXIT_TPL_TEXT = [
+    "\tjmp\tMtext_post\n",
+]
+
+ARM_DATA_WORD_DIRECTIVE = ".xword"
+X86_DATA_WORD_DIRECTIVE = ".quad"
+
+
+OUTPUT_TARGET_ARCH = "arm64"
+REGS = ARM_REGS
+JMP_TPL_DATA = ARM_JMP_TPL_DATA
+JMP_TPL_TEXT = ARM_JMP_TPL_TEXT
+JMP_TPL_TEXT_LEN = ARM_JMP_TPL_TEXT_LEN
+EXIT_TPL_TEXT = ARM_EXIT_TPL_TEXT
 EXIT_TPL_TEXT_LEN = len(EXIT_TPL_TEXT) * 4
+JMP_INSTR_LIMITS = ARM_JMP_INSTR_LIMITS
+DATA_WORD_DIRECTIVE = ARM_DATA_WORD_DIRECTIVE
+
+
+def set_output_arch(target_arch: str):
+    global OUTPUT_TARGET_ARCH
+    global REGS, JMP_TPL_DATA, JMP_TPL_TEXT, JMP_TPL_TEXT_LEN
+    global EXIT_TPL_TEXT, EXIT_TPL_TEXT_LEN
+    global JMP_INSTR_LIMITS, DATA_WORD_DIRECTIVE
+
+    if target_arch not in SUPPORTED_OUTPUT_ARCHS:
+        raise ValueError("Unsupported target arch: " + str(target_arch))
+
+    OUTPUT_TARGET_ARCH = target_arch
+    if target_arch == "arm64":
+        REGS = ARM_REGS
+        JMP_TPL_DATA = ARM_JMP_TPL_DATA
+        JMP_TPL_TEXT = ARM_JMP_TPL_TEXT
+        JMP_TPL_TEXT_LEN = ARM_JMP_TPL_TEXT_LEN
+        EXIT_TPL_TEXT = ARM_EXIT_TPL_TEXT
+        JMP_INSTR_LIMITS = ARM_JMP_INSTR_LIMITS
+        DATA_WORD_DIRECTIVE = ARM_DATA_WORD_DIRECTIVE
+    else:
+        REGS = X86_REGS
+        JMP_TPL_DATA = X86_JMP_TPL_DATA
+        JMP_TPL_TEXT = X86_JMP_TPL_TEXT
+        JMP_TPL_TEXT_LEN = X86_JMP_TPL_TEXT_LEN
+        EXIT_TPL_TEXT = X86_EXIT_TPL_TEXT
+        JMP_INSTR_LIMITS = X86_JMP_INSTR_LIMITS
+        DATA_WORD_DIRECTIVE = X86_DATA_WORD_DIRECTIVE
+    EXIT_TPL_TEXT_LEN = len(EXIT_TPL_TEXT) * 4
 
 # N, Z, C, V => 31, 30, 29, 28
 # values to generate specific condition

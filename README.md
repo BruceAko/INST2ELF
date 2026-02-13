@@ -20,7 +20,7 @@ pip3 install capstone
 
 ```command
 $python3 elfgen.py --help
-usage: elfgen.py [-h] [--output str] [--verbose] str [str ...]
+usage: elfgen.py [-h] [--output str] [--target-arch {arm64,x86_64}] [--verbose] str [str ...]
 
 positional arguments:
   str                   The filepaths of the bbt dump files
@@ -28,6 +28,8 @@ positional arguments:
 optional arguments:
   -h, --help            show this help message and exit
   --output str          Output path
+  --target-arch {arm64,x86_64}
+                        Output binary arch (input trace is always decoded as ARM64)
   --verbose             Print more information of the tool
 ```
 
@@ -40,3 +42,9 @@ python3 elfgen.py raw_data/bbt_carts_20230629/bbt_dump_1 --output raw_data/bbt_c
 ```
 
 If successful, a binary file named raw_data/bbt_carts_20230629/bbt_elf_1.bin will be generated.
+
+To generate a binary that runs on x86_64 while replaying control-flow from ARM64 traces:
+
+```shell
+python3 elfgen.py raw_data/bbt_carts_20230629/bbt_dump_1 --output raw_data/bbt_carts_20230629/bbt_elf_1_x86 --target-arch x86_64
+```
