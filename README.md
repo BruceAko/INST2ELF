@@ -20,16 +20,22 @@ pip3 install capstone
 
 ```command
 $python3 elfgen.py --help
-usage: elfgen.py [-h] [--output str] [--target-arch {arm64,x86_64}] [--verbose] str [str ...]
+usage: elfgen.py [-h] [--output OUTPUT] [--target-arch {arm64,x86_64}]
+                 [--x86-strict-layout] [--x86-base-addr X86_BASE_ADDR]
+                 [--verbose]
+                 filepaths [filepaths ...]
 
 positional arguments:
   str                   The filepaths of the bbt dump files
 
 optional arguments:
   -h, --help            show this help message and exit
-  --output str          Output path
+  --output OUTPUT       Output path
   --target-arch {arm64,x86_64}
                         Output binary arch (input trace is always decoded as ARM64)
+  --x86-strict-layout   Enable fixed x86_64 section layout for stricter front-end comparison
+  --x86-base-addr X86_BASE_ADDR
+                        Base virtual address used by --x86-strict-layout
   --verbose             Print more information of the tool
 ```
 
@@ -47,4 +53,10 @@ To generate a binary that runs on x86_64 while replaying control-flow from ARM64
 
 ```shell
 python3 elfgen.py raw_data/bbt_carts_20230629/bbt_dump_1 --output raw_data/bbt_carts_20230629/bbt_elf_1_x86 --target-arch x86_64
+```
+
+For stricter x86_64 L1I comparison (fixed section starts + non-PIE link):
+
+```shell
+python3 elfgen.py raw_data/bbt_carts_20230629/bbt_dump_1 --output raw_data/bbt_carts_20230629/bbt_elf_1_x86_strict --target-arch x86_64 --x86-strict-layout
 ```

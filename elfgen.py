@@ -10,6 +10,7 @@ from instr_stream import *
 
 TARGET_ARCH = "arm64"
 X86_SLOT_BYTES = 8
+DEFAULT_X86_STRICT_BASE_ADDR = 0x10000000
 
 # Keep elfgen.py imported constants synchronized with instr_stream module globals.
 def refresh_arch_globals():
@@ -57,6 +58,59 @@ def x86_write_text_entries(asm_fw, text_entries: list):
             asm_fw.write(entry)
             continue
         x86_write_slot_instruction(asm_fw, entry)
+
+
+def align_up(value: int, align: int):
+    return ((value + align - 1) // align) * align
+
+
+def align_with_page_offset(min_start: int, page_offset: int):
+    # Keep section start's intra-page offset aligned with trace section start.
+    aligned = align_up(min_start, PAGE_SIZE)
+    return aligned + (page_offset % PAGE_SIZE)
+
+
+def x86_count_text_bytes(text_entries: list):
+    size = 0
+    for entry in text_entries:
+        stripped = entry.strip()
+        if stripped == "":
+            continue
+        if stripped.endswith(":") or stripped.startswith("."):
+            continue
+        size += X86_SLOT_BYTES
+    return size
+
+
+def build_x86_strict_layout(section_stream_list: list, x86_base_addr: int):
+    if len(section_stream_list) == 0:
+        raise ValueError("No section stream found for x86 strict layout")
+
+    arm_anchor = section_stream_list[0].sb_range_list[0][0]
+    # Keep strict layout deterministic and close enough for x86 rel32 branches.
+    base_addr = align_up(x86_base_addr, PAGE_SIZE) + (arm_anchor % PAGE_SIZE)
+
+    section_starts = {}
+    current_end = base_addr
+    prev_arm_end = arm_anchor
+    for i, ss in enumerate(section_stream_list):
+        arm_start = ss.sb_range_list[0][0]
+        # Retain a bounded portion of original inter-section gap; cap to keep rel32 reachable.
+        arm_gap = max(0, arm_start - prev_arm_end)
+        bounded_gap = min(arm_gap, 256 * PAGE_SIZE)
+        min_start = current_end + bounded_gap
+        mapped_start = align_with_page_offset(min_start, arm_start % PAGE_SIZE)
+        mapped_size = x86_count_text_bytes(ss.text_asm)
+        if mapped_size == 0:
+            mapped_size = PAGE_SIZE
+        section_starts[".Mtext_"+str(i)] = mapped_start
+        current_end = mapped_start + mapped_size
+        prev_arm_end = ss.sb_range_list[-1][1]
+
+    # Keep tail sections deterministic and separated from text.
+    section_starts[".Mtext_post"] = align_up(current_end + PAGE_SIZE, PAGE_SIZE)
+    section_starts[".Mdata"] = align_up(section_starts[".Mtext_post"] + PAGE_SIZE, PAGE_SIZE)
+    return section_starts
 
 # multi_targets_handling does not use block's index and jmp_instr
 # just use br mnemonic
@@ -561,10 +615,14 @@ class RecordParser:
 
 if __name__ == "__main__":
     # Parse script args
-    parser = argparse.ArgumentParser(formatter_class=argparse.MetavarTypeHelpFormatter)
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('filepaths', help="The filepaths of the bbt dump files", nargs='+', type=str)
     parser.add_argument('--output', help="Output path", type=str)
     parser.add_argument('--target-arch', help="Output binary arch", choices=instr_stream_cfg.SUPPORTED_OUTPUT_ARCHS, default="arm64")
+    parser.add_argument('--x86-strict-layout', action="store_true",
+                        help="Enable fixed x86_64 section layout for stricter front-end comparison")
+    parser.add_argument('--x86-base-addr', type=lambda x: int(x, 0), default=DEFAULT_X86_STRICT_BASE_ADDR,
+                        help="Base virtual address used by --x86-strict-layout")
     parser.add_argument('--verbose', action="store_true", help="Print more information of the tool")
     args = parser.parse_args()
 
@@ -572,6 +630,8 @@ if __name__ == "__main__":
     TARGET_ARCH = args.target_arch
     instr_stream_cfg.set_output_arch(TARGET_ARCH)
     refresh_arch_globals()
+    if args.x86_strict_layout and TARGET_ARCH != "x86_64":
+        parser.error("--x86-strict-layout requires --target-arch x86_64")
 
     if args.verbose:
         logging.basicConfig(format='%(levelname)7s: %(message)s', level=logging.DEBUG)
@@ -920,6 +980,16 @@ if __name__ == "__main__":
                 stat_fw.write(', '.join(stat_texts)+'\n')
                 addr += 4
 
+    x86_strict_section_starts = None
+    if is_x86_target() and args.x86_strict_layout:
+        x86_strict_section_starts = build_x86_strict_layout(section_stream_list, args.x86_base_addr)
+        logging.info("+ x86 strict layout enabled")
+        logging.info("+ x86 strict text base anchor: " + hex(x86_strict_section_starts[".Mtext_0"]))
+        with open(bbt_output_path+"_x86_layout.csv", "w") as layout_fw:
+            layout_fw.write("section,vaddr\n")
+            for sec_name, sec_addr in x86_strict_section_starts.items():
+                layout_fw.write(sec_name + "," + hex(sec_addr) + "\n")
+
     logging.info("+ Generating ASM")
     if is_x86_target():
         with open(bbt_output_path+".S", 'w') as asm_fw:
@@ -1050,14 +1120,20 @@ void pr_cntvct(void)
 """)
     # Generate bin file
     logging.info("+ Generating elf binary file")
-    ret = subprocess.call(["gcc", "-c", bbt_output_path+".S", "-o", bbt_output_path+".o"], shell=False)
+    asm_compile_cmd = ["gcc", "-c", bbt_output_path+".S", "-o", bbt_output_path+".o"]
+    if is_x86_target() and args.x86_strict_layout:
+        asm_compile_cmd.append("-fno-pie")
+    ret = subprocess.call(asm_compile_cmd, shell=False)
     if ret != 0:
         logging.warning("Failed to generate "+bbt_output_path+".o")
         exit(1)
     else:
         logging.info("Succeed to generate "+bbt_output_path+".o")
 
-    ret = subprocess.call(["gcc", "-c", bbt_output_path+"_helper.c", "-o", bbt_output_path+"_helper.o"], shell=False)
+    helper_compile_cmd = ["gcc", "-c", bbt_output_path+"_helper.c", "-o", bbt_output_path+"_helper.o"]
+    if is_x86_target() and args.x86_strict_layout:
+        helper_compile_cmd.append("-fno-pie")
+    ret = subprocess.call(helper_compile_cmd, shell=False)
     if ret != 0:
         logging.warning("Failed to generate "+bbt_output_path+"_helper.o")
         exit(1)
@@ -1065,7 +1141,14 @@ void pr_cntvct(void)
         logging.info("Succeed to generate "+bbt_output_path+"_helper.o")
 
     if is_x86_target():
-        ret = subprocess.call(["gcc", bbt_output_path+".o", bbt_output_path+"_helper.o", "-o", bbt_output_path+".bin"], shell=False)
+        if args.x86_strict_layout:
+            link_cmd = ["gcc", bbt_output_path+".o", bbt_output_path+"_helper.o", "-no-pie"]
+            for sec_name, sec_addr in x86_strict_section_starts.items():
+                link_cmd.append("-Wl,--section-start="+sec_name+"="+hex(sec_addr))
+            link_cmd += ["-o", bbt_output_path+".bin"]
+        else:
+            link_cmd = ["gcc", bbt_output_path+".o", bbt_output_path+"_helper.o", "-o", bbt_output_path+".bin"]
+        ret = subprocess.call(link_cmd, shell=False)
     else:
         ret = subprocess.call(["gcc", bbt_output_path+".o", bbt_output_path+"_helper.o", "-T", bbt_output_path+".lds", "-o", bbt_output_path+".bin"], shell=False)
     if ret != 0:
@@ -1074,7 +1157,10 @@ void pr_cntvct(void)
     else:
         logging.info("Succeed to generate "+bbt_output_path+".bin")
 
-    ret = subprocess.call([bbt_output_path+".bin"], shell=False)
+    exec_cmd = [bbt_output_path+".bin"]
+    if is_x86_target() and args.x86_strict_layout and shutil.which("setarch") is not None:
+        exec_cmd = ["setarch", "x86_64", "-R", bbt_output_path+".bin"]
+    ret = subprocess.call(exec_cmd, shell=False)
     if ret != 1:
         logging.warning("Failed to execute "+bbt_output_path+".bin")
         exit(1)

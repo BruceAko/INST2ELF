@@ -19,6 +19,54 @@
 
 这部分具体原理可以看下文的该小节帮助理解：[《Inst2ELF工具原理》](https://alidocs.dingtalk.com/i/nodes/qnYMoO1rWxrkmoj2IQYj9p2jJ47Z3je9?utm_scene=person_space&iframeQuery=anchorId%3Duu_mlgi9jg9so4xadnkp3n)
 
+> 说明（新增）：当前工具支持双输出架构 `arm64` / `x86_64`。  
+> 输入 Trace 仍然固定为 ARM64 指令流（Capstone 按 ARM64 解析），`--target-arch` 只影响“生成出来的回放二进制”运行在哪个 ISA 上。  
+> 因此，上文“通过 `.lds` 精确复刻地址布局”的描述对 `arm64` 路径完全成立；对 `x86_64` 路径则是“控制流时序和分支模式复刻优先”，地址通过标签映射而非原始 ARM64 虚拟地址直接落位。
+
+## 新增：x86_64 输出模式（ARM64 Trace 输入不变）
+
+### 入口参数
+
+```bash
+python3 elfgen.py <bbt_dump...> --output <prefix> --target-arch x86_64
+```
+
+* `--target-arch` 默认值仍是 `arm64`，不影响历史行为。
+* `--target-arch x86_64` 时，工具走 x86 汇编生成和 x86 链接路径。
+* `--x86-strict-layout` 用于开启“固定节地址 + 非 PIE”模式，提升 L1I 对比实验的可重复性。
+* `--x86-base-addr` 可指定 strict 模式的布局基址（默认 `0x10000000`）。
+
+### 设计目标
+
+* **不改变输入语义**：仍然使用 ARM64 Trace 作为“真实执行轨迹”来源。
+* **改变输出 ISA**：将同一条轨迹重放为 x86_64 可执行文件，用于跨架构前端行为对比。
+* **保证可回放性**：通过跳转表驱动控制流，保持分支出现顺序与目标模式。
+
+### 关键实现差异
+
+1. 架构模板切换：
+* 在 `instr_stream.py` 中通过 `set_output_arch()` 切换寄存器池、跳转模板、数据伪指令（ARM64 用 `.xword`，x86_64 用 `.quad`）。
+
+2. 条件分支数据模型：
+* ARM64 路径为 `b.cond/cbz/tbz` 写入 NZCV 或寄存器构造值。
+* x86_64 路径写入 0/1 条件值，配合 `cmp/test + jne` 执行分支方向选择。
+
+3. 地址映射方式：
+* x86_64 路径在汇编中为每个 Trace 地址生成 `LADDR_<hex>` 标签。
+* 跳转表写入 `.quad LADDR_xxx`，由汇编器/链接器解析真实跳转目的。
+
+4. 变长指令对齐策略：
+* x86 指令是变长编码，工具对每条生成指令做固定 slot 填充（`8 bytes`），用 `.fill ... , 0x90` 补齐，避免回放时地址步进漂移。
+
+5. 计时与链接：
+* ARM64 helper 使用 `cntvct_el0`；x86_64 helper 使用 `rdtsc`。
+* ARM64 继续使用 `template.lds` 绝对地址布局；x86_64 采用默认链接脚本，不依赖 ARM 专用 `.lds`。
+
+6. strict 布局（可选）：
+* x86_64 strict 模式启用 `-no-pie/-fno-pie`，避免每次运行随机重定位。
+* 通过 `--section-start` 固定 `.Mtext_* / .Mtext_post / .Mdata` 的虚拟地址。
+* 为满足 x86 `rel32`（约 ±2GB）可达性，工具会压缩超大段间空洞，但保持 section 内地址推进和页内偏移一致性。
+
 ---
 
 ## 步骤拆解
@@ -654,6 +702,30 @@ if len(mid_block.sregs) > 0:
 1.  `**.S**` **文件**：包含了程序的控制流逻辑（汇编代码）和决策数据（跳转表）。
     
 2.  `**.lds**` **文件**：强制规定了这些代码和数据在内存中的物理位置，确保它们严格按照 Trace 录制时的地址分布进行加载。
+
+#### x86_64 分支补充（新增）
+
+当 `--target-arch x86_64` 时，本步骤在实现上会走另一条代码路径，主要差异如下：
+
+1. 汇编头部切换为 Intel 语法：
+* 使用 `.intel_syntax noprefix`。
+* `main` 中先调用 `pr_cntvct`，然后通过 `lea <reg>, jmp_table_<reg>[rip]` 初始化跳转表指针寄存器，最后跳到 `LBB0`。
+
+2. 代码段写入策略：
+* 仍按 `.Mtext_N` 分段组织，但每条生成指令会被包裹为固定 `8B` slot（不足填 `0x90`），以控制地址推进的一致性。
+* 每个 Trace 指令地址都会映射到一个 `LADDR_xxx` 标签，供间接跳转表引用。
+
+3. 数据段写入策略：
+* 跳转表项从 ARM64 的 `.xword` 切换为 x86_64 的 `.quad`。
+* 对“无条件/间接跳转”写入 `LADDR_xxx` 标签地址；对“条件分支”写入 `0/1` 条件值。
+
+4. 链接脚本策略：
+* x86_64 路径不复制也不依赖 `template.lds`，由系统默认链接脚本完成布局。
+* 因此 x86_64 的目标是“控制流模式复刻”，而不是 ARM64 原始虚拟地址的一字不差复刻。
+
+5. strict 模式补充：
+* 若打开 `--x86-strict-layout`，链接阶段会为 `.Mtext_N/.Mtext_post/.Mdata` 注入固定 `--section-start`。
+* 同时启用 `-no-pie`，保证二进制每次加载地址稳定，便于重复测量 L1I miss。
     
 
 ### Generating elf binary file
@@ -687,6 +759,8 @@ subprocess.call(["gcc", "-c", bbt_output_path+"_hc.c", "-o", bbt_output_path+"_h
     
 *   **输出**：辅助目标文件（例如 `output_hc.o`）。包含了 `pr_cntvct`（计时）函数的机器码。
     
+*   **x86_64补充**：helper 内部计时指令改为 `rdtsc`（替代 ARM64 的 `mrs ..., cntvct_el0`）。
+    
 
 #### 3. 链接生成 ELF (Link)
 
@@ -701,6 +775,12 @@ subprocess.call(["gcc", bbt_output_path+".o", bbt_output_path+"_hc.o", "-T", bbt
     *   这确保了代码段会被放在 `0xffff00000000` 这样的高地址，数据段放在 `0xfffe10000000`，完全复刻 Trace 录制时的地址空间分布。
         
 *   **输出**：最终的可执行 ELF 文件（例如 `output.bin`）。
+    
+*   **x86_64补充**：链接时不传 `-T <output>.lds`，命令等价为：
+    
+```python
+subprocess.call(["gcc", bbt_output_path+".o", bbt_output_path+"_helper.o", "-o", bbt_output_path+".bin"], shell=False)
+```
     
 
 #### 4. 执行验证 (Execute & Verify)
@@ -823,6 +903,26 @@ def multi_targets_handling(block: InstrBasicBlock):
         # jmp_snippet 是一段共享的 trampoline 代码
         block.text_asm.append("\tb\tjmp_snippet"+str(block.index)+'\n')
 ```
+
+### x86_64 对应实现（新增）
+
+为了在 x86_64 上复用同一份 ARM64 Trace，`elfgen.py` 新增了 `*_x86` 分支处理函数（如 `one_target_handling_x86` / `two_targets_handling_x86` / `multi_targets_handling_x86`）：
+
+1. 多目标/超距跳转：
+* 采用 `lea <sreg>, [<sreg>+8]` + `jmp qword ptr [<sreg>-8]` 的查表跳转形式。
+* 与 ARM64 的 `ldr + br` 语义等价，仍由跳转表驱动。
+
+2. 双目标条件分支：
+* 使用 `cmp qword ptr [<sreg>], 0` + `lea <sreg>, [<sreg>+8]` + `jne LBBx`。
+* 跳转表中写入 0/1，以驱动分支方向。
+
+3. 单目标条件分支：
+* 可内联时用 `mov/test/jne` 保留“条件分支形态”。
+* 空间不足或目标不稳定时，降级为通用查表间接跳转。
+
+4. 地址引用模型：
+* x86_64 路径在 `Filling Superblock's text_asm` 阶段注入 `LADDR_<trace_addr>` 标签。
+* 数据段写入 `.quad LADDR_<trace_addr>`，而不是直接写 ARM64 的原始绝对地址字面量。
 ---
 
 ## 内存布局仿真 (`elfgen.py` Section Generation)
